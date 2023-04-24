@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"github.com/99designs/keyring"
+	"github.com/majd/ipatool/pkg/appstore"
 	"github.com/majd/ipatool/pkg/log"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -12,17 +13,26 @@ func downloadCmd() *cobra.Command {
 	var acquireLicense bool
 	var outputPath string
 	var bundleID string
+	var ipaPaths []string
 
 	cmd := &cobra.Command{
 		Use:   "download",
 		Short: "Download (encrypted) iOS app packages from the App Store",
 		RunE: func(cmd *cobra.Command, args []string) error {
+
+			var out appstore.DownloadOutput
+
 			appstore, err := newAppStore(cmd, keychainPassphrase)
 			if err != nil {
 				return errors.Wrap(err, "failed to create appstore client")
 			}
 
-			out, err := appstore.Download(bundleID, outputPath, acquireLicense)
+			if len(ipaPaths) == 0 {
+				out, err = appstore.Download(bundleID, outputPath, acquireLicense)
+			} else {
+				out, err = appstore.DownloadPaths(bundleID, outputPath, ipaPaths, acquireLicense)
+			}
+
 			if err != nil {
 				return err
 			}
@@ -36,6 +46,7 @@ func downloadCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target iOS app (required)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "The destination path of the downloaded app package")
+	cmd.Flags().StringArrayVarP(&ipaPaths, "ipa-path", "p", []string{}, "The Payload/XXX/<ipa-path> of the file within the ipa you want to download")
 	cmd.Flags().BoolVar(&acquireLicense, "purchase", false, "Obtain a license for the app if needed")
 
 	if keyringBackendType() == keyring.FileBackend {

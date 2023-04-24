@@ -4,14 +4,17 @@ import (
 	"archive/zip"
 	"bytes"
 	"fmt"
+	"github.com/blacktop/ranger"
 	"github.com/majd/ipatool/pkg/http"
 	"github.com/majd/ipatool/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/schollz/progressbar/v3"
 	"howett.net/plist"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -46,34 +49,135 @@ type DownloadOutput struct {
 	DestinationPath string
 }
 
-func (a *appstore) Download(bundleID string, outputPath string, acquireLicense bool) (DownloadOutput, error) {
-	acc, err := a.account()
+func newPartialZipReader(urlStr string) (*zip.Reader, error) {
+
+	url, err := url.Parse(urlStr)
 	if err != nil {
-		return DownloadOutput{}, errors.Wrap(err, ErrGetAccount.Error())
+		return nil, err
+	}
+
+	reader, err := ranger.NewReader(&ranger.HTTPRanger{URL: url})
+
+	if err != nil {
+		return nil, err
+	}
+
+	length, err := reader.Length()
+
+	if err != nil {
+		return nil, err
+	}
+
+	zr, err := zip.NewReader(reader, length)
+	if err != nil {
+		return nil, err
+	}
+	return zr, nil
+
+}
+
+func (a *appstore) DownloadPaths(bundleID string, outputPath string, ipaPaths []string, acquireLicense bool) (DownloadOutput, error) {
+
+	acc, app, guid, err := a.resolveDownload(bundleID, acquireLicense)
+
+	if err != nil {
+		return DownloadOutput{}, err
+	}
+
+	item, err := a.downloadItem(acc, app, guid, acquireLicense, false)
+
+	if err != nil {
+		return DownloadOutput{}, err
+	}
+
+	zip, err := newPartialZipReader(item.URL)
+
+	if err != nil {
+		return DownloadOutput{}, errors.Wrap(err, ErrDownloadFile.Error())
+	}
+
+downloadPath:
+	for _, ipaPath := range ipaPaths {
+
+		re, err := regexp.Compile("Payload/([^.]*).app/" + regexp.QuoteMeta(ipaPath))
+
+		if err != nil {
+			return DownloadOutput{}, err
+		}
+
+		for _, file := range zip.File {
+			path := file.Name
+			if re.Match([]byte(path)) {
+
+				reader, err := zip.Open(file.Name)
+				if err != nil {
+					return DownloadOutput{}, errors.Wrap(err, ErrDownloadFile.Error())
+				}
+
+				defer reader.Close()
+				fullPath := filepath.Join(outputPath, file.Name)
+
+				os.MkdirAll(filepath.Dir(fullPath), os.ModePerm)
+
+				a.logger.Log().Str("downloading", file.Name).Send()
+
+				err = a.doDownload(reader, fullPath, int64(file.UncompressedSize64))
+				if err != nil {
+					return DownloadOutput{}, errors.Wrap(err, ErrDownloadFile.Error())
+				}
+				continue downloadPath
+			}
+		}
+		a.logger.Log().Str("missing_path", ipaPath).Send()
+
+	}
+
+	return DownloadOutput{}, nil
+
+}
+
+func (a *appstore) resolveDownload(bundleID string, acquireLicense bool) (acc Account, app App, guid string, err error) {
+	acc, err = a.account()
+	if err != nil {
+		err = errors.Wrap(err, ErrGetAccount.Error())
+		return
 	}
 
 	countryCode, err := a.countryCodeFromStoreFront(acc.StoreFront)
 	if err != nil {
-		return DownloadOutput{}, errors.Wrap(err, ErrInvalidCountryCode.Error())
+		err = errors.Wrap(err, ErrInvalidCountryCode.Error())
+		return
 	}
 
-	app, err := a.lookup(bundleID, countryCode)
+	app, err = a.lookup(bundleID, countryCode)
 	if err != nil {
-		return DownloadOutput{}, errors.Wrap(err, ErrAppLookup.Error())
+		err = errors.Wrap(err, ErrAppLookup.Error())
+		return
+	}
+
+	macAddr, err := a.machine.MacAddress()
+	if err != nil {
+		err = errors.Wrap(err, ErrGetMAC.Error())
+		return
+	}
+
+	guid = strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
+	a.logger.Verbose().Str("mac", macAddr).Str("guid", guid).Send()
+
+	return
+}
+
+func (a *appstore) Download(bundleID string, outputPath string, acquireLicense bool) (DownloadOutput, error) {
+
+	acc, app, guid, err := a.resolveDownload(bundleID, acquireLicense)
+	if err != nil {
+		return DownloadOutput{}, err
 	}
 
 	destination, err := a.resolveDestinationPath(app, outputPath)
 	if err != nil {
 		return DownloadOutput{}, errors.Wrap(err, ErrResolveDestinationPath.Error())
 	}
-
-	macAddr, err := a.machine.MacAddress()
-	if err != nil {
-		return DownloadOutput{}, errors.Wrap(err, ErrGetMAC.Error())
-	}
-
-	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
-	a.logger.Verbose().Str("mac", macAddr).Str("guid", guid).Send()
 
 	err = a.download(acc, app, destination, guid, acquireLicense, true)
 	if err != nil {
@@ -84,66 +188,16 @@ func (a *appstore) Download(bundleID string, outputPath string, acquireLicense b
 		DestinationPath: destination,
 	}, nil
 }
-
 func (a *appstore) download(acc Account, app App, dst, guid string, acquireLicense, attemptToRenewCredentials bool) error {
-	req := a.downloadRequest(acc, app, guid)
 
-	res, err := a.downloadClient.Send(req)
-	if err != nil {
-		return errors.Wrap(err, ErrRequest.Error())
-	}
-
-	if res.Data.FailureType == FailureTypePasswordTokenExpired {
-		if attemptToRenewCredentials {
-			a.logger.Verbose().Msg("retrieving new password token")
-			acc, err = a.login(acc.Email, acc.Password, "", guid, 0, true)
-			if err != nil {
-				return errors.Wrap(err, ErrPasswordTokenExpired.Error())
-			}
-
-			return a.download(acc, app, dst, guid, acquireLicense, false)
-		}
-
-		return ErrPasswordTokenExpired
-	}
-
-	if res.Data.FailureType == FailureTypeLicenseNotFound && acquireLicense {
-		a.logger.Verbose().Msg("attempting to acquire license")
-		err = a.purchase(app.BundleID, guid, true)
-		if err != nil {
-			return errors.Wrap(err, ErrPurchase.Error())
-		}
-
-		return a.download(acc, app, dst, guid, false, attemptToRenewCredentials)
-	}
-
-	if res.Data.FailureType == FailureTypeLicenseNotFound {
-		return ErrLicenseRequired
-	}
-
-	if res.Data.FailureType != "" && res.Data.CustomerMessage != "" {
-		a.logger.Verbose().Interface("response", res).Send()
-		return errors.New(res.Data.CustomerMessage)
-	}
-
-	if res.Data.FailureType != "" {
-		a.logger.Verbose().Interface("response", res).Send()
-		return ErrGeneric
-	}
-
-	if len(res.Data.Items) == 0 {
-		a.logger.Verbose().Interface("response", res).Send()
-		return ErrInvalidResponse
-	}
-
-	item := res.Data.Items[0]
+	item, err := a.downloadItem(acc, app, guid, acquireLicense, attemptToRenewCredentials)
 
 	err = a.downloadFile(fmt.Sprintf("%s.tmp", dst), item.URL)
 	if err != nil {
 		return errors.Wrap(err, ErrDownloadFile.Error())
 	}
 
-	err = a.applyPatches(item, acc, fmt.Sprintf("%s.tmp", dst), dst)
+	err = a.applyPatches(*item, acc, fmt.Sprintf("%s.tmp", dst), dst)
 	if err != nil {
 		return errors.Wrap(err, ErrPatchApp.Error())
 	}
@@ -154,6 +208,63 @@ func (a *appstore) download(acc Account, app App, dst, guid string, acquireLicen
 	}
 
 	return nil
+}
+
+func (a *appstore) downloadItem(acc Account, app App, guid string, acquireLicense, attemptToRenewCredentials bool) (*DownloadItemResult, error) {
+
+	req := a.downloadRequest(acc, app, guid)
+
+	res, err := a.downloadClient.Send(req)
+	if err != nil {
+		return nil, errors.Wrap(err, ErrRequest.Error())
+	}
+
+	if res.Data.FailureType == FailureTypePasswordTokenExpired {
+		if attemptToRenewCredentials {
+			a.logger.Verbose().Msg("retrieving new password token")
+			acc, err = a.login(acc.Email, acc.Password, "", guid, 0, true)
+			if err != nil {
+				return nil, errors.Wrap(err, ErrPasswordTokenExpired.Error())
+			}
+
+			return a.downloadItem(acc, app, guid, acquireLicense, false)
+		}
+
+		return nil, ErrPasswordTokenExpired
+	}
+
+	if res.Data.FailureType == FailureTypeLicenseNotFound && acquireLicense {
+		a.logger.Verbose().Msg("attempting to acquire license")
+		err = a.purchase(app.BundleID, guid, true)
+		if err != nil {
+			return nil, errors.Wrap(err, ErrPurchase.Error())
+		}
+
+		return a.downloadItem(acc, app, guid, false, attemptToRenewCredentials)
+	}
+
+	if res.Data.FailureType == FailureTypeLicenseNotFound {
+		return nil, ErrLicenseRequired
+	}
+
+	if res.Data.FailureType != "" && res.Data.CustomerMessage != "" {
+		a.logger.Verbose().Interface("response", res).Send()
+		return nil, errors.New(res.Data.CustomerMessage)
+	}
+
+	if res.Data.FailureType != "" {
+		a.logger.Verbose().Interface("response", res).Send()
+		return nil, ErrGeneric
+	}
+
+	if len(res.Data.Items) == 0 {
+		a.logger.Verbose().Interface("response", res).Send()
+		return nil, ErrInvalidResponse
+	}
+
+	item := res.Data.Items[0]
+
+	return &item, nil
 }
 
 func (a *appstore) downloadFile(dst, sourceURL string) (err error) {
@@ -173,6 +284,10 @@ func (a *appstore) downloadFile(dst, sourceURL string) (err error) {
 		}
 	}()
 
+	return a.doDownload(res.Body, dst, res.ContentLength)
+}
+
+func (a *appstore) doDownload(body io.ReadCloser, dst string, contentLength int64) error {
 	file, err := a.os.OpenFile(dst, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return errors.Wrap(err, ErrOpenFile.Error())
@@ -184,11 +299,11 @@ func (a *appstore) downloadFile(dst, sourceURL string) (err error) {
 		}
 	}()
 
-	sizeMB := float64(res.ContentLength) / (1 << 20)
+	sizeMB := float64(contentLength) / (1 << 20)
 	a.logger.Verbose().Str("size", fmt.Sprintf("%.2fMB", sizeMB)).Msg("downloading")
 
 	if a.interactive {
-		bar := progressbar.NewOptions64(res.ContentLength,
+		bar := progressbar.NewOptions64(contentLength,
 			progressbar.OptionSetDescription("downloading"),
 			progressbar.OptionSetWriter(os.Stdout),
 			progressbar.OptionShowBytes(true),
@@ -203,9 +318,9 @@ func (a *appstore) downloadFile(dst, sourceURL string) (err error) {
 			progressbar.OptionSetPredictTime(false),
 		)
 
-		_, err = io.Copy(io.MultiWriter(file, bar), res.Body)
+		_, err = io.Copy(io.MultiWriter(file, bar), body)
 	} else {
-		_, err = io.Copy(file, res.Body)
+		_, err = io.Copy(file, body)
 	}
 
 	if err != nil {

@@ -17,6 +17,7 @@ type AppStore interface {
 	Search(term string, limit int64) (SearchOutput, error)
 	Purchase(bundleID string) error
 	Download(bundleID string, outputPath string, acquireLicense bool) (DownloadOutput, error)
+	DownloadPaths(bundleID string, outputPath string, ipaPaths []string, acquireLicense bool) (DownloadOutput, error)
 }
 
 type appstore struct {
