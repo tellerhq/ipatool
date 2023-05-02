@@ -76,6 +76,34 @@ func newPartialZipReader(urlStr string) (*zip.Reader, error) {
 
 }
 
+func (a *appstore) ListFiles(bundleID string, acquireLicense bool) ([]string, error) {
+
+	acc, app, guid, err := a.resolveDownload(bundleID, acquireLicense)
+	if err != nil {
+		return nil, err
+	}
+
+	item, err := a.downloadItem(acc, app, guid, acquireLicense, false)
+
+	if err != nil {
+		return nil, err
+	}
+
+	zip, err := newPartialZipReader(item.URL)
+	if err != nil {
+		return nil, errors.Wrap(err, ErrDownloadFile.Error())
+	}
+
+	var paths []string
+
+	for _, file := range zip.File {
+		path := file.Name
+		paths = append(paths, path)
+	}
+
+	return paths, nil
+}
+
 func (a *appstore) DownloadPaths(bundleID string, outputPath string, ipaPaths []string, acquireLicense bool) (DownloadOutput, error) {
 
 	acc, app, guid, err := a.resolveDownload(bundleID, acquireLicense)
