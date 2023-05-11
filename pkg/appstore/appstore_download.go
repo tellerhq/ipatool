@@ -3,6 +3,7 @@ package appstore
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"github.com/blacktop/ranger"
 	"github.com/majd/ipatool/pkg/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/schollz/progressbar/v3"
 	"howett.net/plist"
 	"io"
+	nhttp "net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -49,14 +51,34 @@ type DownloadOutput struct {
 	DestinationPath string
 }
 
-func newPartialZipReader(urlStr string) (*zip.Reader, error) {
+func keylogWriter() io.Writer {
+
+	value, exists := os.LookupEnv("SSLKEYLOGFILE")
+	if exists {
+		writer, _ := os.OpenFile(value, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0775)
+		return writer
+	} else {
+		return nil
+	}
+}
+
+func (a *appstore) newPartialZipReader(urlStr string) (*zip.Reader, error) {
 
 	url, err := url.Parse(urlStr)
 	if err != nil {
 		return nil, err
 	}
 
-	reader, err := ranger.NewReader(&ranger.HTTPRanger{URL: url})
+	transport := nhttp.DefaultTransport.(*nhttp.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{
+		KeyLogWriter: keylogWriter(),
+	}
+
+	client := nhttp.Client{
+		Transport: transport,
+	}
+
+	reader, err := ranger.NewReader(&ranger.HTTPRanger{URL: url, Client: &client})
 
 	if err != nil {
 		return nil, err
@@ -118,7 +140,7 @@ func (a *appstore) DownloadPaths(bundleID string, outputPath string, ipaPaths []
 		return DownloadOutput{}, err
 	}
 
-	zip, err := newPartialZipReader(item.URL)
+	zip, err := a.newPartialZipReader(item.URL)
 
 	if err != nil {
 		return DownloadOutput{}, errors.Wrap(err, ErrDownloadFile.Error())

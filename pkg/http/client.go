@@ -2,11 +2,13 @@ package http
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"github.com/pkg/errors"
 	"howett.net/plist"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -38,14 +40,33 @@ func (adt *AddHeaderTransport) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 func NewClient[R interface{}](args ClientArgs) Client[R] {
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	transport.TLSClientConfig = &tls.Config{
+		KeyLogWriter: keylogWriter(),
+	}
+
 	return &client[R]{
 		internalClient: http.Client{
 			Timeout:   0,
 			Jar:       args.CookieJar,
-			Transport: &AddHeaderTransport{http.DefaultTransport},
+			Transport: &AddHeaderTransport{transport},
 		},
 		cookieJar: args.CookieJar,
 	}
+}
+
+func keylogWriter() io.Writer {
+
+	value, exists := os.LookupEnv("SSLKEYLOGFILE")
+	if exists {
+		writer, _ := os.OpenFile(value, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0775)
+		return writer
+	} else {
+		return nil
+	}
+
 }
 
 func (c *client[R]) Send(req Request) (Result[R], error) {
