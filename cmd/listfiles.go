@@ -1,53 +1,57 @@
 package cmd
 
 import (
+	"os"
+	"strings"
+
 	"github.com/99designs/keyring"
-	"github.com/majd/ipatool/pkg/appstore"
 	"github.com/majd/ipatool/pkg/log"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
-func downloadCmd() *cobra.Command {
+func listFilesCmd() *cobra.Command {
 	var keychainPassphrase string
 	var acquireLicense bool
-	var outputPath string
 	var bundleID string
-	var ipaPaths []string
+	var outputPath string
 
 	cmd := &cobra.Command{
-		Use:   "download",
-		Short: "Download (encrypted) iOS app packages from the App Store",
+		Use:   "listfiles",
+		Short: "List files in iOS app packages from the App Store",
 		RunE: func(cmd *cobra.Command, args []string) error {
-
-			var out appstore.DownloadOutput
 
 			appstore, err := newAppStore(cmd, keychainPassphrase)
 			if err != nil {
 				return errors.Wrap(err, "failed to create appstore client")
 			}
 
-			if len(ipaPaths) == 0 {
-				out, err = appstore.Download(bundleID, outputPath, acquireLicense)
-			} else {
-				out, err = appstore.DownloadPaths(bundleID, outputPath, ipaPaths, acquireLicense)
-			}
+			out, err := appstore.ListFiles(bundleID, acquireLicense)
 
 			if err != nil {
 				return err
 			}
 
 			logger := cmd.Context().Value("logger").(log.Logger)
-			logger.Log().Str("output", out.DestinationPath).Bool("success", true).Send()
+
+			if outputPath == "" {
+				logger.Log().Strs("output", out).Bool("success", true).Send()
+			} else {
+				pathsString := strings.Join(out, "\n")
+				err := os.WriteFile(outputPath, []byte(pathsString), 0644)
+				if err != nil {
+					return err
+				}
+				logger.Log().Bool("success", true).Send()
+			}
 
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target iOS app (required)")
-	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "The destination path of the downloaded app package")
-	cmd.Flags().StringArrayVarP(&ipaPaths, "ipa-path", "p", []string{}, "The Payload/XXX/<ipa-path> of the file within the ipa you want to download")
 	cmd.Flags().BoolVar(&acquireLicense, "purchase", false, "Obtain a license for the app if needed")
+	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "The destination path to write the files to")
 
 	if keyringBackendType() == keyring.FileBackend {
 		cmd.Flags().StringVar(&keychainPassphrase, "keychain-passphrase", "", "passphrase for unlocking keychain")
